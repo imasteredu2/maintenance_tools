@@ -91,6 +91,28 @@ std::string parseDownloadUrl(const std::string& json, const std::string& filenam
     return "";
 }
 
+// Parse simple manifest JSON: {"version":"X.Y.Z","gui_url":"...","tool_url":"..."}
+struct ManifestInfo { std::string version; std::string guiUrl; std::string toolUrl; };
+
+ManifestInfo parseManifest(const std::string& json) {
+    ManifestInfo mi; mi.version=""; mi.guiUrl=""; mi.toolUrl="";
+    auto findValue = [&](const char* key) -> std::string {
+        std::string k = std::string("\"") + key + "\"";
+        size_t pos = json.find(k);
+        if(pos==std::string::npos) return "";
+        pos = json.find('"', pos + k.size());
+        if(pos==std::string::npos) return "";
+        pos++;
+        size_t end = json.find('"', pos);
+        if(end==std::string::npos) return "";
+        return json.substr(pos, end-pos);
+    };
+    mi.version = findValue("version");
+    mi.guiUrl  = findValue("gui_url");
+    mi.toolUrl = findValue("tool_url");
+    return mi;
+}
+
 // Compare version strings (format: X.Y.Z)
 // Returns: 1 if v1 > v2, -1 if v1 < v2, 0 if equal
 int compareVersions(const std::string& v1, const std::string& v2) {
@@ -115,29 +137,52 @@ std::string trim(const std::string& str) {
 
 // Check for updates and prompt user
 bool checkForUpdates(const std::string& currentVersion, std::string& newVersion) {
-    // Use GitHub API to get latest release
-    const std::string apiUrl = "https://api.github.com/repos/imasteredu2/maintenance_tools/releases/latest";
-    const std::string tempApiFile = "temp_release.json";
-    
-    if(!downloadFile(apiUrl, tempApiFile)) {
+    // Ensure a local 'version' folder exists
+    try {
+        if(!std::filesystem::exists("version")) {
+            std::filesystem::create_directory("version");
+        }
+    } catch(...) {
+        // If we cannot create the directory, fall back to temp file logic
+    }
+
+    // Download version.txt from GitHub (raw) with cache-busting
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    std::string versionUrl = "https://raw.githubusercontent.com/imasteredu2/maintenance_tools/tools/version.txt?t=" + std::to_string(timestamp);
+
+    std::string localVersionPath = (std::filesystem::path("version") / "version.txt").string();
+    if(!downloadFile(versionUrl, localVersionPath)) {
+        // If the raw download fails, try GitHub Releases API as a fallback to read tag_name
+        const std::string apiUrl = "https://api.github.com/repos/imasteredu2/maintenance_tools/releases/latest";
+        const std::string tempApiFile = "version\\latest_release.json";
+        if(downloadFile(apiUrl, tempApiFile)) {
+            std::ifstream apiFile(tempApiFile);
+            if(apiFile) {
+                std::string json((std::istreambuf_iterator<char>(apiFile)), std::istreambuf_iterator<char>());
+                apiFile.close();
+                std::filesystem::remove(tempApiFile);
+                std::string tagVer = parseVersionFromJson(json);
+                if(!tagVer.empty()) {
+                    // Write the parsed version into version/version.txt for consistency
+                    std::ofstream out(localVersionPath, std::ios::trunc);
+                    if(out) { out << tagVer; out.close(); }
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+
+    // Read the downloaded version.txt
+    std::ifstream vfile(localVersionPath);
+    if(!vfile) {
         return false;
     }
-    
-    std::ifstream apiFile(tempApiFile);
-    if(!apiFile) {
-        std::filesystem::remove(tempApiFile);
-        return false;
-    }
-    
-    // Read entire JSON response
-    std::string json((std::istreambuf_iterator<char>(apiFile)), std::istreambuf_iterator<char>());
-    apiFile.close();
-    std::filesystem::remove(tempApiFile);
-    
-    // Parse version from tag_name
-    newVersion = parseVersionFromJson(json);
-    if(newVersion.empty()) return false;
-    
+    std::getline(vfile, newVersion);
+    newVersion = trim(newVersion);
+    vfile.close();
+
     int cmp = compareVersions(newVersion, currentVersion);
     return cmp > 0; // true if new version is higher
 }
@@ -173,27 +218,43 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int){
             
             int result = MessageBoxA(NULL, msg, "Update Available", MB_YESNO|MB_ICONINFORMATION);
             if(result == IDYES) {
-                // Get download URLs from GitHub release
+                // Prefer manifest asset 'update.json' in latest release; fallback to asset search
                 const std::string apiUrl = "https://api.github.com/repos/imasteredu2/maintenance_tools/releases/latest";
-                const std::string tempApiFile = "temp_release2.json";
-                
+                const std::string tempApiFile = "version\\latest_release.json";
                 if(!downloadFile(apiUrl, tempApiFile)) {
                     showError("Update Failed", "Failed to fetch release information.");
                     return 1;
                 }
-                
                 std::ifstream apiFile(tempApiFile);
                 std::string json((std::istreambuf_iterator<char>(apiFile)), std::istreambuf_iterator<char>());
                 apiFile.close();
                 std::filesystem::remove(tempApiFile);
-                
-                // Parse download URLs from release assets
-                std::string guiFilename = "maintenance_tool_gui_v" + newVersion + ".exe";
-                std::string toolFilename = "maintenance_tool_v" + newVersion + ".exe";
-                
-                std::string guiUrl = parseDownloadUrl(json, guiFilename);
-                std::string toolUrl = parseDownloadUrl(json, toolFilename);
-                
+
+                // Attempt to locate manifest asset URL
+                std::string manifestUrl = parseDownloadUrl(json, "update.json");
+                std::string guiUrl, toolUrl;
+
+                if(!manifestUrl.empty()) {
+                    const std::string tempManifest = "version\\update.json";
+                    if(downloadFile(manifestUrl, tempManifest)) {
+                        std::ifstream mf(tempManifest);
+                        std::string mjson((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+                        mf.close();
+                        std::filesystem::remove(tempManifest);
+                        ManifestInfo mi = parseManifest(mjson);
+                        if(!mi.version.empty()) newVersion = mi.version; // ensure consistency
+                        guiUrl = mi.guiUrl; toolUrl = mi.toolUrl;
+                    }
+                }
+
+                // Fallback: parse direct asset URLs
+                if(guiUrl.empty() || toolUrl.empty()) {
+                    std::string guiFilename = "maintenance_tool_gui_v" + newVersion + ".exe";
+                    std::string toolFilename = "maintenance_tool_v" + newVersion + ".exe";
+                    guiUrl = parseDownloadUrl(json, guiFilename);
+                    toolUrl = parseDownloadUrl(json, toolFilename);
+                }
+
                 if(guiUrl.empty() || toolUrl.empty()) {
                     showError("Update Failed", "Failed to find download URLs in release.");
                     return 1;

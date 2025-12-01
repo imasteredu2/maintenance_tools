@@ -1124,7 +1124,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
     case WM_COMMAND: {
         int id = LOWORD(w);
         if(id==1000) { PostMessage(h, WM_CLOSE, 0, 0); }
-        else if(id==1001) { checkForUpdates(); }
+        else if(id==1001) { doCheckForUpdates(); }
         else if(id==1002) { showAbout(); }
         else if(id==1) refreshJobs();
         else if(id==2) doBackup();
