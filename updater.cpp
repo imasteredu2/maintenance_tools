@@ -7,6 +7,7 @@
 #include <cstring>
 #include <thread>
 #include <fstream>
+#include <chrono>
 
 #pragma comment(lib, "wininet.lib")
 
@@ -18,7 +19,7 @@ bool downloadFile(const std::string& url, const std::string& localPath) {
     HINTERNET hInternet = InternetOpenA("Maintenance Tool Updater", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
     if(!hInternet) return false;
     
-    HINTERNET hUrl = InternetOpenUrlA(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
+    HINTERNET hUrl = InternetOpenUrlA(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
     if(!hUrl) {
         InternetCloseHandle(hInternet);
         return false;
@@ -41,6 +42,53 @@ bool downloadFile(const std::string& url, const std::string& localPath) {
     InternetCloseHandle(hUrl);
     InternetCloseHandle(hInternet);
     return true;
+}
+
+// Parse JSON manually to extract version from GitHub API response
+std::string parseVersionFromJson(const std::string& json) {
+    // Find "tag_name":"vX.Y.Z"
+    size_t pos = json.find("\"tag_name\"");
+    if(pos == std::string::npos) return "";
+    
+    pos = json.find("\"v", pos);
+    if(pos == std::string::npos) return "";
+    pos += 2; // Skip "v
+    
+    size_t end = json.find("\"", pos);
+    if(end == std::string::npos) return "";
+    
+    return json.substr(pos, end - pos);
+}
+
+// Parse download URL for GUI executable from GitHub release assets
+std::string parseDownloadUrl(const std::string& json, const std::string& filename) {
+    // Find the asset with matching name
+    size_t pos = 0;
+    while((pos = json.find("\"name\"", pos)) != std::string::npos) {
+        size_t nameStart = json.find("\"", pos + 6);
+        if(nameStart == std::string::npos) break;
+        nameStart++;
+        size_t nameEnd = json.find("\"", nameStart);
+        if(nameEnd == std::string::npos) break;
+        
+        std::string assetName = json.substr(nameStart, nameEnd - nameStart);
+        if(assetName == filename) {
+            // Found the asset, now get browser_download_url
+            size_t urlPos = json.find("\"browser_download_url\"", nameEnd);
+            if(urlPos != std::string::npos) {
+                size_t urlStart = json.find("\"", urlPos + 22);
+                if(urlStart != std::string::npos) {
+                    urlStart++;
+                    size_t urlEnd = json.find("\"", urlStart);
+                    if(urlEnd != std::string::npos) {
+                        return json.substr(urlStart, urlEnd - urlStart);
+                    }
+                }
+            }
+        }
+        pos = nameEnd;
+    }
+    return "";
 }
 
 // Compare version strings (format: X.Y.Z)
@@ -67,23 +115,28 @@ std::string trim(const std::string& str) {
 
 // Check for updates and prompt user
 bool checkForUpdates(const std::string& currentVersion, std::string& newVersion) {
-    const std::string versionUrl = "https://raw.githubusercontent.com/imasteredu2/maintenance_tools/tools/version.txt";
-    const std::string tempVersionFile = "temp_version.txt";
+    // Use GitHub API to get latest release
+    const std::string apiUrl = "https://api.github.com/repos/imasteredu2/maintenance_tools/releases/latest";
+    const std::string tempApiFile = "temp_release.json";
     
-    if(!downloadFile(versionUrl, tempVersionFile)) {
+    if(!downloadFile(apiUrl, tempApiFile)) {
         return false;
     }
     
-    std::ifstream vfile(tempVersionFile);
-    if(!vfile) {
-        std::filesystem::remove(tempVersionFile);
+    std::ifstream apiFile(tempApiFile);
+    if(!apiFile) {
+        std::filesystem::remove(tempApiFile);
         return false;
     }
     
-    std::getline(vfile, newVersion);
-    newVersion = trim(newVersion);
-    vfile.close();
-    std::filesystem::remove(tempVersionFile);
+    // Read entire JSON response
+    std::string json((std::istreambuf_iterator<char>(apiFile)), std::istreambuf_iterator<char>());
+    apiFile.close();
+    std::filesystem::remove(tempApiFile);
+    
+    // Parse version from tag_name
+    newVersion = parseVersionFromJson(json);
+    if(newVersion.empty()) return false;
     
     int cmp = compareVersions(newVersion, currentVersion);
     return cmp > 0; // true if new version is higher
@@ -120,9 +173,31 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int){
             
             int result = MessageBoxA(NULL, msg, "Update Available", MB_YESNO|MB_ICONINFORMATION);
             if(result == IDYES) {
-                // Download new executables
-                const std::string guiUrl = "https://github.com/imasteredu2/maintenance_tools/raw/tools/built/maintenance_tool_gui_v" + newVersion + ".exe";
-                const std::string toolUrl = "https://github.com/imasteredu2/maintenance_tools/raw/tools/built/maintenance_tool_v" + newVersion + ".exe";
+                // Get download URLs from GitHub release
+                const std::string apiUrl = "https://api.github.com/repos/imasteredu2/maintenance_tools/releases/latest";
+                const std::string tempApiFile = "temp_release2.json";
+                
+                if(!downloadFile(apiUrl, tempApiFile)) {
+                    showError("Update Failed", "Failed to fetch release information.");
+                    return 1;
+                }
+                
+                std::ifstream apiFile(tempApiFile);
+                std::string json((std::istreambuf_iterator<char>(apiFile)), std::istreambuf_iterator<char>());
+                apiFile.close();
+                std::filesystem::remove(tempApiFile);
+                
+                // Parse download URLs from release assets
+                std::string guiFilename = "maintenance_tool_gui_v" + newVersion + ".exe";
+                std::string toolFilename = "maintenance_tool_v" + newVersion + ".exe";
+                
+                std::string guiUrl = parseDownloadUrl(json, guiFilename);
+                std::string toolUrl = parseDownloadUrl(json, toolFilename);
+                
+                if(guiUrl.empty() || toolUrl.empty()) {
+                    showError("Update Failed", "Failed to find download URLs in release.");
+                    return 1;
+                }
                 
                 std::string tempGui = "temp_gui.exe";
                 std::string tempTool = "temp_tool.exe";
