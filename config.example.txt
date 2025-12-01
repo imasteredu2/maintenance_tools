@@ -1,0 +1,61 @@
+# Example configuration file for Business Maintenance Tool
+# This file demonstrates multiple backup jobs with different settings
+
+[job:DailyDocuments]
+sources=C:/Users/YourName/Documents|C:/Users/YourName/Desktop
+destinations=D:/Backups/Daily|E:/OffSiteBackup
+override=0
+incremental=1
+shortcuts=C:/Program Files/Notepad++/notepad++.exe|C:/Windows/System32/calc.exe
+schedule_enabled=1
+schedule_interval=daily
+schedule_value=1
+schedule_time=02:00
+last_run=0
+schedule_dest=D:/ScheduledBackups/Documents
+schedule_onetime=0
+additional_schedules=weekly|1|23:00|E:/WeeklyBackup|0|0|monthly|1|01:00|F:/MonthlyArchive|0|0
+
+[job:WeeklyFullSystem]
+sources=C:/ImportantData|C:/Projects|C:/Users/YourName/Pictures
+destinations=D:/Backups/Weekly
+override=0
+incremental=0
+
+[job:QuickBackup]
+sources=C:/Users/YourName/Documents/Critical
+destinations=D:/Backups/Quick
+override=1
+incremental=0
+shortcuts=
+schedule_enabled=1
+schedule_interval=hours
+schedule_value=4
+schedule_time=00:00
+last_run=0
+schedule_dest=D:/HourlyBackups
+schedule_onetime=0
+additional_schedules=
+
+[job:OneTimeReport]
+sources=C:/Reports/Q4
+destinations=D:/Backups/Reports
+override=0
+incremental=0
+shortcuts=
+schedule_enabled=1
+schedule_interval=once
+schedule_value=1
+schedule_time=17:00
+last_run=0
+schedule_dest=D:/Backups/Reports/Q4_Final
+schedule_onetime=1
+additional_schedules=
+
+# Job explanation:
+# - DailyDocuments: Incremental backup running daily at 2 AM to D:/ScheduledBackups/Documents
+#                   Also has additional weekly backup Sunday 11 PM to E:/WeeklyBackup
+#                   And monthly backup 1st of month 1 AM to F:/MonthlyArchive
+# - WeeklyFullSystem: Full backup weekly (no incremental) with timestamps
+# - QuickBackup: Override mode - replaces previous backup, runs every 4 hours to D:/HourlyBackups
+# - OneTimeReport: One-time scheduled backup at 5 PM, will disable after first run
