@@ -206,7 +206,7 @@ void switchTab(int index) {
         if (tabIndex == 0) {
             // Show home, hide backup
             if (isHomeControl) ShowWindow(child, SW_SHOW);
-            if (isBackupControl) ShowWindow(child, SW_HIDE);
+            if (isBackupControl || id == 19) ShowWindow(child, SW_HIDE);
             if (isStatic) {
                 char text[256];
                 GetWindowTextA(child, text, sizeof(text));
@@ -216,7 +216,7 @@ void switchTab(int index) {
         } else {
             // Show backup, hide home
             if (isHomeControl) ShowWindow(child, SW_HIDE);
-            if (isBackupControl) ShowWindow(child, SW_SHOW);
+            if (isBackupControl || id == 19) ShowWindow(child, SW_SHOW);
             if (isStatic) {
                 char text[256];
                 GetWindowTextA(child, text, sizeof(text));
@@ -968,6 +968,32 @@ void doCombineNonOverride(){
     SendMessageA(hStatus, WM_SETTEXT,0,(LPARAM)"Combine running...");
 }
 
+void doCheckForUpdates(){
+    SendMessageA(hStatus, WM_SETTEXT,0,(LPARAM)"Checking for updates...");
+    
+    // Get current executable directory
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    std::filesystem::path p(exePath);
+    auto dir = p.parent_path();
+    std::string updaterPath = (dir / "updater.exe").string();
+    
+    // Launch updater with --check-update flag
+    SHELLEXECUTEINFOA sei{sizeof(sei)};
+    sei.lpVerb = "open";
+    sei.lpFile = updaterPath.c_str();
+    sei.lpParameters = "--check-update";
+    sei.nShow = SW_SHOWNORMAL;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    
+    if(ShellExecuteExA(&sei)) {
+        SendMessageA(hStatus, WM_SETTEXT,0,(LPARAM)"Update check complete.");
+    } else {
+        MessageBoxA(NULL, "Failed to launch updater.", "Error", MB_OK|MB_ICONERROR);
+        SendMessageA(hStatus, WM_SETTEXT,0,(LPARAM)"Update check failed.");
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
     case WM_CREATE: {
         // Enable dark mode/theme support for window
@@ -1041,8 +1067,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
         HWND hBtnDelete = CreateWindow("BUTTON","Delete Job", WS_CHILD|BS_PUSHBUTTON, 200,95,85,30,h,(HMENU)12,NULL,NULL);
         HWND hBtnRefresh = CreateWindow("BUTTON","Refresh", WS_CHILD|BS_PUSHBUTTON, 290,95,85,30,h,(HMENU)1,NULL,NULL);
         
-        // Row 3: Combine button
+        // Row 3: Combine and Update buttons
         HWND hBtnCombine = CreateWindow("BUTTON","Combine Non-Override", WS_CHILD|BS_PUSHBUTTON, 20,130,160,30,h,(HMENU)18,NULL,NULL);
+        HWND hBtnCheckUpdate = CreateWindow("BUTTON","Check for Updates", WS_CHILD|BS_PUSHBUTTON, 185,130,190,30,h,(HMENU)19,NULL,NULL);
         
         // Jobs list on Backup tab
         HWND hLblJobs = CreateWindow("STATIC","Backup Jobs:", WS_CHILD|SS_LEFT, 20,170,150,20,h,NULL,NULL,NULL);
@@ -1108,6 +1135,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
         else if(id==7) doLogoff();
         else if(id==16) doLock();
         else if(id==18) doCombineNonOverride();
+        else if(id==19) doCheckForUpdates();
         else if(id==8) addShortcut();
         else if(id==9) createJob();
         else if(id==10) editJob();
