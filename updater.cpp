@@ -297,8 +297,8 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int){
                         
                         std::string guiFilename = "maintenance_tool_gui_v" + newVersion + ".exe";
                         std::string toolFilename = "maintenance_tool_v" + newVersion + ".exe";
-                        std::string guiUrl = "https://github.com/imasteredu2/maintenance_tools/releases/download/v" + newVersion + "/" + guiFilename;
-                        std::string toolUrl = "https://github.com/imasteredu2/maintenance_tools/releases/download/v" + newVersion + "/" + toolFilename;
+                        std::string guiUrl = "https://raw.githubusercontent.com/imasteredu2/maintenance_tools/tools/built/" + guiFilename;
+                        std::string toolUrl = "https://raw.githubusercontent.com/imasteredu2/maintenance_tools/tools/built/" + toolFilename;
                         
                         std::string tempGui = (dir / ("temp_gui_" + newVersion + ".exe")).string();
                         std::string tempTool = (dir / ("temp_tool_" + newVersion + ".exe")).string();
@@ -394,8 +394,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int){
                 if(guiUrl.empty() || toolUrl.empty()) {
                     std::string guiFilename = "maintenance_tool_gui_v" + newVersion + ".exe";
                     std::string toolFilename = "maintenance_tool_v" + newVersion + ".exe";
-                    guiUrl = parseDownloadUrl(json, guiFilename);
-                    toolUrl = parseDownloadUrl(json, toolFilename);
+                    // Use raw GitHub URLs instead of release assets
+                    guiUrl = "https://raw.githubusercontent.com/imasteredu2/maintenance_tools/tools/built/" + guiFilename;
+                    toolUrl = "https://raw.githubusercontent.com/imasteredu2/maintenance_tools/tools/built/" + toolFilename;
                 }
 
                 if(guiUrl.empty() || toolUrl.empty()) {
