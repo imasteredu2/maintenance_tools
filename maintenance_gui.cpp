@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
+#include <wininet.h>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -16,10 +17,21 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "wininet.lib")
 
 struct Job { std::string name; }; // Simplified for GUI listing
 static const char* CONFIG_FILE = "config.txt";
 static const char* SHORTCUT_FILE = "shortcuts.txt"; // persistence for shortcuts
+static const char* THEME_FILE = "theme.txt"; // theme preference
+static const char* SETTINGS_FILE = "settings.txt"; // application settings
+
+// Settings structure
+struct AppSettings {
+    bool autoUpdateAt24h = true; // Auto-update when 24hr check finds new version
+    int updateCheckIntervalHours = 12; // Check for updates every N hours (default 12)
+};
+
+AppSettings appSettings;
 
 // Forward declarations
 std::string trim(const std::string& s);
@@ -27,6 +39,8 @@ void toggleDeleteMode();
 void performDeleteSelected();
 void toggleEditMode();
 void performEdit(size_t idx);
+void loadSettings();
+void saveSettings();
 
 int compareVersions(const std::string& a, const std::string& b){
     int am=0, an=0, ap=0; int bm=0, bn=0, bp=0;
@@ -91,6 +105,47 @@ void checkForUpdates(){
 
 std::string trim(const std::string& s){ size_t b=0,e=s.size(); while(b<e && isspace((unsigned char)s[b]))++b; while(e>b && isspace((unsigned char)s[e-1]))--e; return s.substr(b,e-b);} 
 
+void loadSettings() {
+    appSettings.autoUpdateAt24h = true;
+    appSettings.updateCheckIntervalHours = 12;
+    
+    std::ifstream in(SETTINGS_FILE);
+    if(!in.is_open()) return;
+    
+    std::string line;
+    while(std::getline(in, line)) {
+        line = trim(line);
+        if(line.empty() || line[0] == '#') continue;
+        
+        size_t eqPos = line.find('=');
+        if(eqPos == std::string::npos) continue;
+        
+        std::string key = trim(line.substr(0, eqPos));
+        std::string value = trim(line.substr(eqPos + 1));
+        
+        if(key == "auto_update_at_24h") {
+            appSettings.autoUpdateAt24h = (value == "1" || value == "true");
+        } else if(key == "update_check_interval_hours") {
+            try {
+                int val = std::stoi(value);
+                if(val >= 1 && val <= 24) appSettings.updateCheckIntervalHours = val;
+            } catch(...) {}
+        }
+    }
+    in.close();
+}
+
+void saveSettings() {
+    std::ofstream out(SETTINGS_FILE);
+    if(!out.is_open()) return;
+    
+    out << "# Application Settings\n";
+    out << "auto_update_at_24h=" << (appSettings.autoUpdateAt24h ? "1" : "0") << "\n";
+    out << "update_check_interval_hours=" << appSettings.updateCheckIntervalHours << "\n";
+    
+    out.close();
+}
+
 std::vector<Job> loadJobs(){ std::vector<Job> jobs; std::ifstream in(CONFIG_FILE); if(!in.is_open()) return jobs; std::string line; Job current; bool inJob=false; while(std::getline(in,line)){ line=trim(line); if(line.empty()) continue; if(line.rfind("[job:",0)==0 && line.back()==']'){ if(inJob){ jobs.push_back(current); current=Job(); } current.name=trim(line.substr(5,line.size()-6)); inJob=true; } } if(inJob) jobs.push_back(current); return jobs; }
 
 void runCommand(const std::string& cmd){ STARTUPINFOA si{sizeof(si)}; PROCESS_INFORMATION pi{}; std::string cpy=cmd; if(CreateProcessA(NULL, cpy.data(), NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){ CloseHandle(pi.hThread); WaitForSingleObject(pi.hProcess, INFINITE); CloseHandle(pi.hProcess);} }
@@ -100,19 +155,172 @@ void toolInvoke(const std::string& args){ char exePath[MAX_PATH]; GetModuleFileN
 
 HWND hList; HWND hStatus; HWND hShortcutsPanel;
 HWND hBtnShutdown, hBtnRestart, hBtnLogoff, hBtnUpdateRestart;
+HWND hBtnAdd, hBtnSave, hBtnEdit, hBtnDelete; // Shortcut management buttons
+HWND hBtnBackup, hBtnRestore, hBtnStatus; // Backup tab main buttons
+HWND hBtnCreate, hBtnEditJob, hBtnDeleteJob, hBtnRefresh; // Backup tab job buttons
+HWND hBtnCombine, hBtnCheckUpdate; // Backup tab utility buttons
 HBRUSH hBrushRed, hBrushYellow, hBrushOrange, hBrushBlue, hBrushGreen;
 std::vector<std::pair<std::string, HWND>> shortcuts; // path, hwnd
 std::vector<HWND> shortcutChecks; // checkboxes for delete mode
+std::vector<HICON> shortcutIcons; // icons for shortcuts
 int nextShortcutId = 100;
 int nextShortcutY = 10;
+HWND hMainWindow = NULL;
 HWND hTabControl;
 HWND hHomeTab, hBackupTab;
 bool deleteMode = false;
 bool editMode = false;
+bool darkTheme = false;
+HBRUSH hBrushBg, hBrushBgDark, hBrushControlBg, hBrushControlBgDark;
 
 void refreshJobs(){ auto jobs = loadJobs(); SendMessage(hList, LB_RESETCONTENT, 0, 0); for(auto& j: jobs){ SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)j.name.c_str()); } SendMessageA(hStatus, WM_SETTEXT, 0, (LPARAM)"Jobs refreshed."); }
 
-// Save current shortcut paths to file
+// Reposition shortcut buttons/checkboxes within the shortcuts panel
+void layoutShortcutsUI(){
+    if(!hShortcutsPanel || !hMainWindow) return;
+    RECT rcPanel; GetWindowRect(hShortcutsPanel, &rcPanel);
+    POINT pt = {rcPanel.left, rcPanel.top};
+    ScreenToClient(hMainWindow, &pt);
+    
+    // Get panel size to constrain buttons within
+    int panelW = rcPanel.right - rcPanel.left;
+    int panelH = rcPanel.bottom - rcPanel.top;
+    int btnW = panelW - 40; // Leave margin on sides
+    if(btnW < 200) btnW = 200;
+    
+    nextShortcutY = 10;
+    for(size_t i=0;i<shortcuts.size();++i){
+        int baseX = pt.x + 20;  // 20px margin from left edge of panel
+        int baseY = pt.y + 10 + (int)i * 35;
+        
+        // Only show if within panel bounds
+        if(baseY + 30 <= pt.y + panelH) {
+            SetWindowPos(shortcuts[i].second, NULL, baseX, baseY, btnW, 30, SWP_NOZORDER|SWP_SHOWWINDOW);
+        } else {
+            ShowWindow(shortcuts[i].second, SW_HIDE);
+        }
+        
+        if(i < shortcutChecks.size() && shortcutChecks[i]){
+            int chkX = baseX - 20;  // Position checkbox to the left of button, within panel
+            int chkY = baseY + 7;
+            // Bring checkbox to front and ensure it's visible within bounds
+            SetWindowPos(shortcutChecks[i], HWND_TOP, chkX, chkY, 16, 16, SWP_SHOWWINDOW);
+            if(!deleteMode && !editMode) ShowWindow(shortcutChecks[i], SW_HIDE);
+        }
+        nextShortcutY += 35;
+    }
+}
+
+// Re-layout controls on resize to anchor to edges
+void layoutAllUI(int clientW, int clientH){
+    if(!hMainWindow) return;
+    const int margin = 20;
+    const int statusH = 20;
+    const int tabH = 30;
+    int tabY = 10;
+    int availableW = clientW - 2*margin;
+    if(availableW < 200) availableW = 200;
+    MoveWindow(hTabControl, margin, tabY, availableW, tabH, TRUE);
+    int y = tabY + tabH + 10;
+    // Row 1 system buttons
+    int btnW = 85, btnH = 35;
+    int gap = (availableW - 4*btnW) / 3; if(gap < 5) gap = 5;
+    int x = margin;
+    MoveWindow(hBtnLogoff, x, y, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(hBtnUpdateRestart, x, y, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(hBtnRestart, x, y, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(hBtnShutdown, x, y, btnW, btnH, TRUE);
+    // Lock button
+    y += btnH + 5;
+    MoveWindow(GetDlgItem(hMainWindow, 16), margin, y, availableW, 30, TRUE);
+    // Shortcut management row
+    y += 30 + 10;
+    btnW = 85; btnH = 30; gap = (availableW - 4*btnW) / 3; if(gap < 5) gap = 5; x = margin;
+    MoveWindow(GetDlgItem(hMainWindow, 8), x, y, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 13), x, y, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 14), x, y, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 15), x, y, btnW, btnH, TRUE);
+    // Shortcuts label and panel
+    y += btnH + 10;
+    HWND hLblShortcuts = GetDlgItem(hMainWindow, 17);
+    if(hLblShortcuts) MoveWindow(hLblShortcuts, margin, y, availableW, 20, TRUE);
+    y += 20;
+    int panelH = clientH - y - statusH - margin; if(panelH < 120) panelH = 120;
+    MoveWindow(hShortcutsPanel, margin, y, availableW, panelH, TRUE);
+    // Backup tab controls mirror positions
+    int backupY = tabY + tabH + 10;
+    btnW = 110; btnH = 35; gap = (availableW - (btnW*3) - 125) / 2; if(gap < 5) gap = 5; x = margin;
+    MoveWindow(GetDlgItem(hMainWindow, 2), x, backupY, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 3), x, backupY, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 11), x, backupY, 125, btnH, TRUE);
+    backupY += btnH + 10;
+    btnW = 85; btnH = 30; gap = (availableW - 4*btnW) / 3; if(gap < 5) gap = 5; x = margin;
+    MoveWindow(GetDlgItem(hMainWindow, 9), x, backupY, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 10), x, backupY, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 12), x, backupY, btnW, btnH, TRUE); x += btnW + gap;
+    MoveWindow(GetDlgItem(hMainWindow, 1), x, backupY, btnW, btnH, TRUE);
+    backupY += btnH + 10;
+    MoveWindow(GetDlgItem(hMainWindow, 18), margin, backupY, 160, 30, TRUE);
+    MoveWindow(GetDlgItem(hMainWindow, 19), margin + 165, backupY, availableW - 165, 30, TRUE);
+    backupY += 30 + 10;
+    HWND hLblJobs = NULL; // created without id; skip move
+    int listH = clientH - backupY - statusH - margin; if(listH < 120) listH = 120;
+    MoveWindow(hList, margin, backupY, availableW, listH, TRUE);
+    // Status bar
+    MoveWindow(hStatus, 10, clientH - statusH - 10, clientW - 20, statusH, TRUE);
+    // Re-layout shortcuts
+    layoutShortcutsUI();
+}
+
+// Load theme preference
+void loadTheme(){
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    std::filesystem::path p(exePath);
+    auto dir = p.parent_path();
+    std::string fullPath = (dir / THEME_FILE).string();
+    
+    std::ifstream in(fullPath);
+    if(in.is_open()) {
+        std::string line;
+        if(std::getline(in, line)) {
+            darkTheme = (trim(line) == "dark");
+        }
+    }
+}
+
+// Save theme preference
+void saveTheme(){
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    std::filesystem::path p(exePath);
+    auto dir = p.parent_path();
+    std::string fullPath = (dir / THEME_FILE).string();
+    
+    std::ofstream out(fullPath, std::ios::trunc);
+    if(out.is_open()) {
+        out << (darkTheme ? "dark" : "light") << "\n";
+    }
+}
+
+// Extract icon from executable
+HICON extractIcon(const std::string& path) {
+    HICON hIcon = NULL;
+    ExtractIconExA(path.c_str(), 0, NULL, &hIcon, 1);
+    if (!hIcon) {
+        // Fallback to large icon
+        ExtractIconExA(path.c_str(), 0, &hIcon, NULL, 1);
+    }
+    if (!hIcon) {
+        // Last resort - get associated icon
+        SHFILEINFOA sfi = {0};
+        SHGetFileInfoA(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON);
+        hIcon = sfi.hIcon;
+    }
+    return hIcon;
+}
+
+// Save current shortcut paths to file with nicknames
 void saveShortcuts(){
     char exePath[MAX_PATH];
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
@@ -126,7 +334,11 @@ void saveShortcuts(){
         return;
     }
     for(auto &sc : shortcuts){
-        out << sc.first << "\n";
+        // Get button text (nickname)
+        char btnText[256];
+        GetWindowTextA(sc.second, btnText, 256);
+        // Save as: path|nickname
+        out << sc.first << "|" << btnText << "\n";
     }
     out.flush();
     out.close();
@@ -146,23 +358,40 @@ void loadShortcuts(HWND hMain){
     while(std::getline(in, line)){
         line = trim(line);
         if(line.empty()) continue;
-        std::filesystem::path p(line);
-        std::string name = p.stem().string();
-        // Center button within shortcuts panel interior (panel width=355)
-        int baseX = 20 + (355 - 240)/2;
-        int baseY = 155 + nextShortcutY; // align with panel top
-        HWND btn = CreateWindow("BUTTON", name.c_str(), WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-                                baseX, baseY, 240, 30, hMain, (HMENU)(UINT_PTR)nextShortcutId, NULL, NULL);
-        // Prepare a hidden checkbox for delete mode
-        // Checkbox as a child of the shortcuts panel so it layers correctly
-        // Place checkbox next to the button inside the panel
-        int chkX = (baseX - 20) - 22; // to the left of centered button, relative to panel
-        int chkY = (baseY - 155) + 7; // vertical center alignment
+        
+        // Parse format: path|nickname or just path (legacy)
+        std::string path = line;
+        std::string name;
+        size_t pipePos = line.find('|');
+        if(pipePos != std::string::npos) {
+            path = line.substr(0, pipePos);
+            name = line.substr(pipePos + 1);
+        } else {
+            // Legacy format - extract name from path
+            std::filesystem::path p(line);
+            name = p.stem().string();
+        }
+        // Compute absolute position based on shortcuts panel
+        RECT rcPanel; GetWindowRect(hShortcutsPanel, &rcPanel);
+        POINT pt = {rcPanel.left, rcPanel.top};
+        ScreenToClient(hMainWindow ? hMainWindow : hMain, &pt);
+        int baseX = pt.x + (355 - 240)/2;
+        int baseY = pt.y + 10 + nextShortcutY; // 10px inset inside panel
+        HWND btn = CreateWindow("BUTTON", name.c_str(), WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_OWNERDRAW,
+                    baseX, baseY, 240, 30, hMain, (HMENU)(UINT_PTR)nextShortcutId, NULL, NULL);
+        // Prepare a hidden checkbox for delete mode next to button
+        int chkX = baseX - 22; // to the left of centered button
+        int chkY = baseY + 7; // vertical center alignment
         HWND chk = CreateWindow("BUTTON", "", WS_CHILD|BS_AUTOCHECKBOX,
-                    chkX, chkY, 16, 16, hShortcutsPanel, NULL, NULL, NULL);
+                chkX, chkY, 16, 16, hMain, NULL, NULL, NULL);
         ShowWindow(chk, SW_HIDE);
         SetWindowPos(btn, HWND_TOP, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE);
-        shortcuts.push_back({line, btn});
+        
+        // Extract and store icon
+        HICON hIcon = extractIcon(path);
+        shortcutIcons.push_back(hIcon);
+        
+        shortcuts.push_back({path, btn});
         shortcutChecks.push_back(chk);
         nextShortcutId++;
         nextShortcutY += 35;
@@ -187,11 +416,10 @@ void switchTab(int index) {
         // Skip tab control and status bar
         if (child == hTabControl || child == hStatus) return TRUE;
         
-        // Home tab controls: buttons 4-8, shortcuts panel, and shortcut buttons (>=100), shortcut management 13-16
+        // Home tab controls: buttons 4-8, shortcuts panel, shortcut buttons/checkboxes (ids >=100), shortcut management 8, 13-17
         int id = GetDlgCtrlID(child);
         
-        // Check if child is a shortcut button or checkbox (parent is shortcuts panel)
-        bool isShortcutChild = (GetParent(child) == hShortcutsPanel);
+        bool isShortcutChild = (id >= 100); // shortcut buttons use ids starting at 100
         
         bool isHomeControl = (id >= 4 && id <= 8) || (id >= 13 && id <= 17) || child == hShortcutsPanel || isShortcutChild;
         
@@ -231,6 +459,29 @@ void switchTab(int index) {
 
 std::string getSelectedJob(){ int idx = (int)SendMessage(hList, LB_GETCURSEL, 0, 0); if(idx == LB_ERR) return ""; char buf[256]; SendMessageA(hList, LB_GETTEXT, idx, (LPARAM)buf); return buf; }
 
+// Structure for individual additional schedule
+struct AdditionalSchedule {
+    std::string interval;
+    std::string value;
+    std::string time;
+    std::string dest;
+    bool onetime;
+    std::string lastRun;
+};
+
+// Dialog data structure for individual schedule editing
+struct ScheduleDialogData {
+    std::string interval;
+    std::string value;
+    std::string time;
+    std::string dest;
+    bool onetime;
+    bool accepted;
+};
+
+// Forward declaration
+void RunScheduleDialog(HWND parent, ScheduleDialogData* data, const char* title);
+
 // Dialog data structure
 struct JobDialogData {
     std::string jobName;
@@ -242,6 +493,10 @@ struct JobDialogData {
     std::string scheduleInterval;
     std::string scheduleValue;
     std::string scheduleTime;
+    std::string startDate;     // NEW: first backup start date/time
+    std::string scheduleDest;  // NEW: schedule-specific destination
+    bool scheduleOneTime;      // NEW: disable after first run
+    std::vector<AdditionalSchedule> additionalSchedules;  // NEW: unlimited schedules
     bool accepted;
 };
 
@@ -319,6 +574,11 @@ LRESULT CALLBACK JobDialogWndProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPa
                 data->scheduleValue = buf;
                 GetDlgItemTextA(hDlg, 109, buf, sizeof(buf));
                 data->scheduleTime = buf;
+                GetDlgItemTextA(hDlg, 112, buf, sizeof(buf));
+                data->startDate = buf;
+                GetDlgItemTextA(hDlg, 110, buf, sizeof(buf));
+                data->scheduleDest = buf;
+                data->scheduleOneTime = IsDlgButtonChecked(hDlg, 111) == BST_CHECKED;
                 data->accepted = true;
                 DestroyWindow(hDlg);
                 PostQuitMessage(0);
@@ -328,6 +588,85 @@ LRESULT CALLBACK JobDialogWndProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPa
                 data->accepted = false;
                 DestroyWindow(hDlg);
                 PostQuitMessage(0);
+                return 0;
+            }
+            else if(LOWORD(wParam) == 114) { // Add Schedule
+                ScheduleDialogData schedData;
+                schedData.interval = "daily";
+                schedData.value = "1";
+                schedData.time = "00:00";
+                schedData.dest = "";
+                schedData.onetime = false;
+                schedData.accepted = false;
+                
+                RunScheduleDialog(hDlg, &schedData, "Add Additional Schedule");
+                
+                if(schedData.accepted) {
+                    AdditionalSchedule newSched;
+                    newSched.interval = schedData.interval;
+                    newSched.value = schedData.value;
+                    newSched.time = schedData.time;
+                    newSched.dest = schedData.dest;
+                    newSched.onetime = schedData.onetime;
+                    newSched.lastRun = "0";
+                    
+                    data->additionalSchedules.push_back(newSched);
+                    
+                    // Update list
+                    HWND hList = GetDlgItem(hDlg, 113);
+                    std::string display = schedData.interval + " (" + schedData.value + ") at " + schedData.time;
+                    if(!schedData.dest.empty()) display += " -> " + schedData.dest;
+                    if(schedData.onetime) display += " [one-time]";
+                    SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)display.c_str());
+                }
+                return 0;
+            }
+            else if(LOWORD(wParam) == 115) { // Edit Schedule
+                HWND hList = GetDlgItem(hDlg, 113);
+                int idx = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if(idx == LB_ERR || idx >= (int)data->additionalSchedules.size()) {
+                    MessageBoxA(hDlg, "Please select a schedule to edit.", "Edit Schedule", MB_OK|MB_ICONINFORMATION);
+                    return 0;
+                }
+                
+                AdditionalSchedule& sched = data->additionalSchedules[idx];
+                ScheduleDialogData schedData;
+                schedData.interval = sched.interval;
+                schedData.value = sched.value;
+                schedData.time = sched.time;
+                schedData.dest = sched.dest;
+                schedData.onetime = sched.onetime;
+                schedData.accepted = false;
+                
+                RunScheduleDialog(hDlg, &schedData, "Edit Additional Schedule");
+                
+                if(schedData.accepted) {
+                    sched.interval = schedData.interval;
+                    sched.value = schedData.value;
+                    sched.time = schedData.time;
+                    sched.dest = schedData.dest;
+                    sched.onetime = schedData.onetime;
+                    
+                    // Update list display
+                    SendMessage(hList, LB_DELETESTRING, idx, 0);
+                    std::string display = schedData.interval + " (" + schedData.value + ") at " + schedData.time;
+                    if(!schedData.dest.empty()) display += " -> " + schedData.dest;
+                    if(schedData.onetime) display += " [one-time]";
+                    SendMessage(hList, LB_INSERTSTRING, idx, (LPARAM)display.c_str());
+                    SendMessage(hList, LB_SETCURSEL, idx, 0);
+                }
+                return 0;
+            }
+            else if(LOWORD(wParam) == 116) { // Delete Schedule
+                HWND hList = GetDlgItem(hDlg, 113);
+                int idx = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if(idx == LB_ERR || idx >= (int)data->additionalSchedules.size()) {
+                    MessageBoxA(hDlg, "Please select a schedule to delete.", "Delete Schedule", MB_OK|MB_ICONINFORMATION);
+                    return 0;
+                }
+                
+                data->additionalSchedules.erase(data->additionalSchedules.begin() + idx);
+                SendMessage(hList, LB_DELETESTRING, idx, 0);
                 return 0;
             }
             break;
@@ -358,9 +697,12 @@ INT_PTR CALLBACK JobDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam
             CheckDlgButton(hDlg, 104, data->override ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(hDlg, 105, data->incremental ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(hDlg, 106, data->scheduleEnabled ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(hDlg, 111, data->scheduleOneTime ? BST_CHECKED : BST_UNCHECKED);
             SetDlgItemTextA(hDlg, 107, data->scheduleInterval.c_str());
             SetDlgItemTextA(hDlg, 108, data->scheduleValue.c_str());
             SetDlgItemTextA(hDlg, 109, data->scheduleTime.c_str());
+            SetDlgItemTextA(hDlg, 112, data->startDate.c_str());
+            SetDlgItemTextA(hDlg, 110, data->scheduleDest.c_str());
             
             return TRUE;
         }
@@ -401,6 +743,151 @@ INT_PTR CALLBACK JobDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam
     return FALSE;
 }
 
+// Dialog procedure for individual schedule editing
+LRESULT CALLBACK ScheduleDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static ScheduleDialogData* data = nullptr;
+    
+    switch(msg) {
+        case WM_CREATE: {
+            CREATESTRUCT* cs = (CREATESTRUCT*)lParam;
+            data = (ScheduleDialogData*)cs->lpCreateParams;
+            SetWindowLongPtr(hDlg, GWLP_USERDATA, (LONG_PTR)data);
+            return 0;
+        }
+        case WM_COMMAND: {
+            data = (ScheduleDialogData*)GetWindowLongPtr(hDlg, GWLP_USERDATA);
+            if(!data) break;
+            
+            if(LOWORD(wParam) == IDOK) {
+                char buf[256];
+                // Get interval from combobox
+                HWND hIntervalCombo = GetDlgItem(hDlg, 201);
+                int intervalIdx = (int)SendMessageA(hIntervalCombo, CB_GETCURSEL, 0, 0);
+                const char* intervals[] = {"mins", "hours", "daily", "weekly", "monthly", "once"};
+                data->interval = (intervalIdx >= 0 && intervalIdx < 6) ? intervals[intervalIdx] : "daily";
+                
+                GetDlgItemTextA(hDlg, 202, buf, sizeof(buf));
+                data->value = buf;
+                GetDlgItemTextA(hDlg, 203, buf, sizeof(buf));
+                data->time = buf;
+                GetDlgItemTextA(hDlg, 204, buf, sizeof(buf));
+                data->dest = buf;
+                data->onetime = IsDlgButtonChecked(hDlg, 205) == BST_CHECKED;
+                data->accepted = true;
+                DestroyWindow(hDlg);
+                PostQuitMessage(0);
+                return 0;
+            }
+            else if(LOWORD(wParam) == IDCANCEL) {
+                data->accepted = false;
+                DestroyWindow(hDlg);
+                PostQuitMessage(0);
+                return 0;
+            }
+            break;
+        }
+    }
+    return DefWindowProc(hDlg, msg, wParam, lParam);
+}
+
+HWND CreateScheduleDialog(HWND parent, ScheduleDialogData* data, const char* title) {
+    static bool registered = false;
+    if(!registered) {
+        WNDCLASSA wc = {0};
+        wc.lpfnWndProc = ScheduleDialogProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.lpszClassName = "ScheduleDialogClass";
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        RegisterClassA(&wc);
+        registered = true;
+    }
+    
+    HWND hDlg = CreateWindowExA(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        "ScheduleDialogClass",
+        title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 450, 350,
+        parent, NULL, GetModuleHandle(NULL), data
+    );
+    
+    int y = 20;
+    
+    // Interval
+    CreateWindowA("STATIC", "Interval:", WS_CHILD|WS_VISIBLE, 20, y, 400, 20, hDlg, NULL, NULL, NULL);
+    y += 24;
+    HWND hIntervalCombo = CreateWindowA("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+        20, y, 400, 150, hDlg, (HMENU)201, NULL, NULL);
+    SendMessageA(hIntervalCombo, CB_ADDSTRING, 0, (LPARAM)"mins");
+    SendMessageA(hIntervalCombo, CB_ADDSTRING, 0, (LPARAM)"hours");
+    SendMessageA(hIntervalCombo, CB_ADDSTRING, 0, (LPARAM)"daily");
+    SendMessageA(hIntervalCombo, CB_ADDSTRING, 0, (LPARAM)"weekly");
+    SendMessageA(hIntervalCombo, CB_ADDSTRING, 0, (LPARAM)"monthly");
+    SendMessageA(hIntervalCombo, CB_ADDSTRING, 0, (LPARAM)"once");
+    // Set current value
+    int idx = 2; // default daily
+    if(data->interval == "mins") idx = 0;
+    else if(data->interval == "hours") idx = 1;
+    else if(data->interval == "daily") idx = 2;
+    else if(data->interval == "weekly") idx = 3;
+    else if(data->interval == "monthly") idx = 4;
+    else if(data->interval == "once") idx = 5;
+    SendMessageA(hIntervalCombo, CB_SETCURSEL, idx, 0);
+    y += 35;
+    
+    // Value
+    CreateWindowA("STATIC", "Value (number):", WS_CHILD|WS_VISIBLE, 20, y, 400, 20, hDlg, NULL, NULL, NULL);
+    y += 24;
+    CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", data->value.c_str(), WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
+        20, y, 400, 24, hDlg, (HMENU)202, NULL, NULL);
+    y += 35;
+    
+    // Time
+    CreateWindowA("STATIC", "Time (HH:MM):", WS_CHILD|WS_VISIBLE, 20, y, 400, 20, hDlg, NULL, NULL, NULL);
+    y += 24;
+    CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", data->time.c_str(), WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
+        20, y, 400, 24, hDlg, (HMENU)203, NULL, NULL);
+    y += 35;
+    
+    // Destination
+    CreateWindowA("STATIC", "Destination (optional):", WS_CHILD|WS_VISIBLE, 20, y, 400, 20, hDlg, NULL, NULL, NULL);
+    y += 24;
+    CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", data->dest.c_str(), WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
+        20, y, 400, 24, hDlg, (HMENU)204, NULL, NULL);
+    y += 35;
+    
+    // One-time checkbox
+    CreateWindowA("BUTTON", "One-time (disable after first run)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+        20, y, 400, 24, hDlg, (HMENU)205, NULL, NULL);
+    CheckDlgButton(hDlg, 205, data->onetime ? BST_CHECKED : BST_UNCHECKED);
+    y += 35;
+    
+    // Buttons
+    CreateWindowA("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 240, y, 80, 30, hDlg, (HMENU)IDOK, NULL, NULL);
+    CreateWindowA("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE, 330, y, 80, 30, hDlg, (HMENU)IDCANCEL, NULL, NULL);
+    
+    return hDlg;
+}
+
+void RunScheduleDialog(HWND parent, ScheduleDialogData* data, const char* title) {
+    HWND hDlg = CreateScheduleDialog(parent, data, title);
+    if(!hDlg) return;
+    
+    EnableWindow(parent, FALSE);
+    ShowWindow(hDlg, SW_SHOW);
+    
+    MSG msg;
+    while(GetMessage(&msg, NULL, 0, 0)) {
+        if(!IsWindow(hDlg)) break;
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+}
+
 // Create dialog template dynamically
 HWND CreateJobDialog(HWND parent, JobDialogData* data, const char* title) {
     // Register dialog window class
@@ -422,7 +909,7 @@ HWND CreateJobDialog(HWND parent, JobDialogData* data, const char* title) {
         "JobDialogClass",
         title,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 640, 800,
+        CW_USEDEFAULT, CW_USEDEFAULT, 640, 1300,
         parent, NULL, GetModuleHandle(NULL), data
     );
     
@@ -507,6 +994,48 @@ HWND CreateJobDialog(HWND parent, JobDialogData* data, const char* title) {
     CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", data->scheduleTime.c_str(), WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL, 20, y, 590, 30, hDlg, (HMENU)109, NULL, NULL);
     y += 45;
     
+    // Start Date/Time
+    CreateWindowA("STATIC", "Start Date (optional):", WS_CHILD|WS_VISIBLE, 20, y, 590, 24, hDlg, NULL, NULL, NULL);
+    CreateWindowA("STATIC", "(YYYY-MM-DD HH:MM - leave blank for immediate start)", WS_CHILD|WS_VISIBLE|SS_LEFT, 20, y+24, 590, 22, hDlg, NULL, NULL, NULL);
+    y += 50;
+    CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", data->startDate.c_str(), WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL, 20, y, 590, 30, hDlg, (HMENU)112, NULL, NULL);
+    y += 45;
+    
+    // Schedule-specific destination
+    CreateWindowA("STATIC", "Schedule Destination (optional override):", WS_CHILD|WS_VISIBLE, 20, y, 590, 24, hDlg, NULL, NULL, NULL);
+    CreateWindowA("STATIC", "(leave blank to use job destinations)", WS_CHILD|WS_VISIBLE|SS_LEFT, 20, y+24, 590, 22, hDlg, NULL, NULL, NULL);
+    y += 50;
+    CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", data->scheduleDest.c_str(), WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL, 20, y, 590, 30, hDlg, (HMENU)110, NULL, NULL);
+    y += 45;
+    
+    // One-time schedule checkbox
+    CreateWindowA("BUTTON", "One-time schedule (disable after first run)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 20, y, 500, 26, hDlg, (HMENU)111, NULL, NULL);
+    CheckDlgButton(hDlg, 111, data->scheduleOneTime ? BST_CHECKED : BST_UNCHECKED);
+    y += 50;
+    
+    // Additional Schedules section
+    CreateWindowA("STATIC", "Additional Schedules (unlimited):", WS_CHILD|WS_VISIBLE, 20, y, 590, 24, hDlg, NULL, NULL, NULL);
+    y += 28;
+    
+    // List box for additional schedules (ID 113)
+    HWND hScheduleList = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", "",
+        WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY, 20, y, 590, 100, hDlg, (HMENU)113, NULL, NULL);
+    
+    // Populate list with existing additional schedules
+    for(const auto& sched : data->additionalSchedules) {
+        std::string display = sched.interval + " (" + sched.value + ") at " + sched.time;
+        if(!sched.dest.empty()) display += " -> " + sched.dest;
+        if(sched.onetime) display += " [one-time]";
+        SendMessageA(hScheduleList, LB_ADDSTRING, 0, (LPARAM)display.c_str());
+    }
+    y += 110;
+    
+    // Buttons for managing additional schedules
+    CreateWindowA("BUTTON", "Add Schedule", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 20, y, 120, 30, hDlg, (HMENU)114, NULL, NULL);
+    CreateWindowA("BUTTON", "Edit Schedule", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 150, y, 120, 30, hDlg, (HMENU)115, NULL, NULL);
+    CreateWindowA("BUTTON", "Delete Schedule", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 280, y, 120, 30, hDlg, (HMENU)116, NULL, NULL);
+    y += 50;
+    
     // Buttons
     CreateWindowA("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 400, y, 105, 40, hDlg, (HMENU)IDOK, NULL, NULL);
     CreateWindowA("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE, 515, y, 105, 40, hDlg, (HMENU)IDCANCEL, NULL, NULL);
@@ -543,6 +1072,8 @@ void createJob() {
     data.scheduleInterval = "daily";
     data.scheduleValue = "1";
     data.scheduleTime = "02:00";
+    data.scheduleDest = "";
+    data.scheduleOneTime = false;
     data.accepted = false;
     
     RunJobDialog(GetParent(hTabControl), &data, "Create New Backup Job");
@@ -560,10 +1091,21 @@ void createJob() {
     out << "schedule_interval=" << data.scheduleInterval << "\n";
     out << "schedule_value=" << data.scheduleValue << "\n";
     out << "schedule_time=" << data.scheduleTime << "\n";
+    out << "start_date=" << data.startDate << "\n";
     out << "last_run=0\n";
-    out << "schedule_dest=\n";
-    out << "schedule_onetime=0\n";
-    out << "additional_schedules=\n";
+    out << "schedule_dest=" << data.scheduleDest << "\n";
+    out << "schedule_onetime=" << (data.scheduleOneTime ? "1" : "0") << "\n";
+    
+    // Serialize additional schedules: interval|value|time|dest|onetime|lastrun
+    out << "additional_schedules=";
+    for(size_t i = 0; i < data.additionalSchedules.size(); ++i) {
+        if(i > 0) out << "|";
+        const auto& s = data.additionalSchedules[i];
+        out << s.interval << "|" << s.value << "|" << s.time << "|" 
+            << s.dest << "|" << (s.onetime ? "1" : "0") << "|" << s.lastRun;
+    }
+    out << "\n";
+    
     out.close();
     
     refreshJobs();
@@ -590,6 +1132,9 @@ void editJob() {
     data.scheduleInterval = "daily";
     data.scheduleValue = "1";
     data.scheduleTime = "02:00";
+    data.startDate = "";
+    data.scheduleDest = "";
+    data.scheduleOneTime = false;
     data.accepted = false;
     
     std::ifstream in(CONFIG_FILE);
@@ -615,6 +1160,31 @@ void editJob() {
             else if(key == "schedule_interval") data.scheduleInterval = val;
             else if(key == "schedule_value") data.scheduleValue = val;
             else if(key == "schedule_time") data.scheduleTime = val;
+            else if(key == "start_date") data.startDate = val;
+            else if(key == "schedule_dest") data.scheduleDest = val;
+            else if(key == "schedule_onetime") data.scheduleOneTime = (val == "1");
+            else if(key == "additional_schedules") {
+                // Parse: interval|value|time|dest|onetime|lastrun|...
+                if(!val.empty()) {
+                    std::stringstream ss(val);
+                    std::string token;
+                    std::vector<std::string> parts;
+                    while(std::getline(ss, token, '|')) {
+                        parts.push_back(token);
+                    }
+                    // Each schedule has 6 fields
+                    for(size_t i = 0; i + 5 < parts.size(); i += 6) {
+                        AdditionalSchedule sched;
+                        sched.interval = parts[i];
+                        sched.value = parts[i+1];
+                        sched.time = parts[i+2];
+                        sched.dest = parts[i+3];
+                        sched.onetime = (parts[i+4] == "1");
+                        sched.lastRun = parts[i+5];
+                        data.additionalSchedules.push_back(sched);
+                    }
+                }
+            }
         }
     }
     in.close();
@@ -645,10 +1215,20 @@ void editJob() {
                 buffer << "schedule_interval=" << data.scheduleInterval << "\n";
                 buffer << "schedule_value=" << data.scheduleValue << "\n";
                 buffer << "schedule_time=" << data.scheduleTime << "\n";
+                buffer << "start_date=" << data.startDate << "\n";
                 buffer << "last_run=0\n";
-                buffer << "schedule_dest=\n";
-                buffer << "schedule_onetime=0\n";
-                buffer << "additional_schedules=\n";
+                buffer << "schedule_dest=" << data.scheduleDest << "\n";
+                buffer << "schedule_onetime=" << (data.scheduleOneTime ? "1" : "0") << "\n";
+                
+                // Serialize additional schedules
+                buffer << "additional_schedules=";
+                for(size_t i = 0; i < data.additionalSchedules.size(); ++i) {
+                    if(i > 0) buffer << "|";
+                    const auto& s = data.additionalSchedules[i];
+                    buffer << s.interval << "|" << s.value << "|" << s.time << "|" 
+                           << s.dest << "|" << (s.onetime ? "1" : "0") << "|" << s.lastRun;
+                }
+                buffer << "\n";
                 
                 inTargetJob = true;
                 jobWritten = true;
@@ -739,6 +1319,8 @@ void toggleEditMode(){
         if(shortcutChecks[i]){
             ShowWindow(shortcutChecks[i], editMode ? SW_SHOW : SW_HIDE);
         }
+        // Redraw shortcut button to show color change
+        if(i < shortcuts.size()) InvalidateRect(shortcuts[i].second, NULL, FALSE);
     }
     if(editMode){
         deleteMode = false; // Exit delete mode if entering edit mode
@@ -783,6 +1365,39 @@ void performEdit(size_t idx){
 
 void editShortcut() { toggleEditMode(); }
 
+// Global for nickname dialog
+static char g_nicknameBuffer[256] = "";
+static bool g_nicknameOk = false;
+
+// Subclassed window proc for our simple nickname dialog
+LRESULT CALLBACK NicknameDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            // Nothing special here; controls already created by caller
+        } return 0;
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == IDOK) {
+                // Read text from edit control
+                GetDlgItemTextA(hDlg, 1001, g_nicknameBuffer, sizeof(g_nicknameBuffer));
+                g_nicknameOk = true;
+                PostMessageA(hDlg, WM_CLOSE, 0, 0);
+                return 0;
+            } else if (id == IDCANCEL) {
+                g_nicknameOk = false;
+                PostMessageA(hDlg, WM_CLOSE, 0, 0);
+                return 0;
+            }
+        } break;
+        case WM_CLOSE: {
+            // Destroy the dialog window to break the loop in caller
+            DestroyWindow(hDlg);
+            return 0;
+        }
+    }
+    return DefWindowProcA(hDlg, msg, wParam, lParam);
+}
+
 void addShortcut() {
     char path[MAX_PATH] = "";
     OPENFILENAMEA ofn = {sizeof(ofn)};
@@ -794,27 +1409,108 @@ void addShortcut() {
     
     if (GetOpenFileNameA(&ofn)) {
         std::filesystem::path p(path);
-        std::string name = p.stem().string();
+        std::string defaultName = p.stem().string();
         
-        // Parent shortcut buttons to the main window so WM_COMMAND is delivered properly
-        HWND hMain = GetParent(hShortcutsPanel);
-        // Center button within shortcuts panel interior (panel width=355)
-        int baseX = 20 + (355 - 240)/2;
-        int baseY = 155 + nextShortcutY; // panel top (155) + offset
+        // Set default nickname
+        strncpy_s(g_nicknameBuffer, defaultName.c_str(), _TRUNCATE);
         
-        HWND btn = CreateWindow("BUTTON", name.c_str(), WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-                    baseX, baseY, 240, 30, hMain, (HMENU)(UINT_PTR)nextShortcutId, NULL, NULL);
-        int chkX = (baseX - 20) - 22;
-        int chkY = (baseY - 155) + 7;
+        // Create a simple dialog dynamically
+        HWND hDlg = CreateWindowExA(
+            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+            "#32770", // Dialog class
+            "Shortcut Name",
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            CW_USEDEFAULT, CW_USEDEFAULT, 350, 140,
+            NULL, NULL, GetModuleHandle(NULL), NULL
+        );
+        
+        if (hDlg) {
+            // Create label
+            CreateWindowA("STATIC", "Enter shortcut name:",
+                WS_CHILD | WS_VISIBLE,
+                10, 10, 320, 20,
+                hDlg, NULL, GetModuleHandle(NULL), NULL);
+            
+            // Create text box
+            HWND hEdit = CreateWindowA("EDIT", g_nicknameBuffer,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                10, 35, 320, 22,
+                hDlg, (HMENU)1001, GetModuleHandle(NULL), NULL);
+            
+            // Create OK button
+            CreateWindowA("BUTTON", "OK",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                100, 70, 70, 25,
+                hDlg, (HMENU)IDOK, GetModuleHandle(NULL), NULL);
+            
+            // Create Cancel button
+            CreateWindowA("BUTTON", "Cancel",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                180, 70, 70, 25,
+                hDlg, (HMENU)IDCANCEL, GetModuleHandle(NULL), NULL);
+            
+            // Subclass the dialog window to our proc
+            SetWindowLongPtrA(hDlg, GWLP_WNDPROC, (LONG_PTR)NicknameDialogProc);
+            
+            // Focus and select all in edit control
+            SetFocus(hEdit);
+            SendMessage(hEdit, EM_SETSEL, 0, -1);
+            
+            // Message loop for dialog
+            MSG msg;
+            bool dialogDone = false;
+            g_nicknameOk = false;
+            
+            while (!dialogDone && GetMessage(&msg, NULL, 0, 0)) {
+                if (msg.hwnd == hDlg || IsChild(hDlg, msg.hwnd)) {
+                    if (msg.message == WM_COMMAND) {
+                        if (LOWORD(msg.wParam) == IDOK || LOWORD(msg.wParam) == IDCANCEL) {
+                            // NicknameDialogProc will set g_nicknameOk and post WM_CLOSE
+                        }
+                    } else if (msg.message == WM_CLOSE) {
+                        dialogDone = true;
+                    }
+                }
+                
+                if (!IsDialogMessage(hDlg, &msg)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+            }
+            
+            if (!g_nicknameOk) return; // User cancelled
+        }
+        
+        std::string name = g_nicknameBuffer;
+        if (name.empty()) name = defaultName; // Fallback
+        
+        // Position within shortcuts panel but parented to main window so WM_DRAWITEM is handled
+        HWND hMain = hMainWindow ? hMainWindow : GetParent(hShortcutsPanel);
+        RECT rcPanel; GetWindowRect(hShortcutsPanel, &rcPanel);
+        POINT pt = {rcPanel.left, rcPanel.top};
+        ScreenToClient(hMain, &pt);
+        
+        int panelW = rcPanel.right - rcPanel.left;
+        int btnW = panelW - 40;
+        if(btnW < 200) btnW = 200;
+        
+        int baseX = pt.x + 20;
+        int baseY = pt.y + 10 + nextShortcutY; // 10px inset inside panel
+        
+        HWND btn = CreateWindow("BUTTON", name.c_str(), WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_OWNERDRAW,
+                baseX, baseY, btnW, 30, hMain, (HMENU)(UINT_PTR)nextShortcutId, NULL, NULL);
+        int chkX = baseX - 20;
+        int chkY = baseY + 7;
         HWND chk = CreateWindow("BUTTON", "", WS_CHILD|BS_AUTOCHECKBOX,
-                chkX, chkY, 16, 16, hShortcutsPanel, NULL, NULL, NULL);
+            chkX, chkY, 16, 16, hMain, NULL, NULL, NULL);
         ShowWindow(chk, SW_HIDE);
         
-        // Ensure button is above the panel in Z-order
-        SetWindowPos(btn, HWND_TOP, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE);
-        BringWindowToTop(btn);
-        InvalidateRect(btn, NULL, TRUE);
-        InvalidateRect(hMain, NULL, FALSE);
+        // Extract and store icon
+        HICON hIcon = extractIcon(std::string(path));
+        shortcutIcons.push_back(hIcon);
+        
+        // Refresh panel
+        InvalidateRect(hShortcutsPanel, NULL, TRUE);
         
         shortcuts.push_back({std::string(path), btn});
         shortcutChecks.push_back(chk);
@@ -832,6 +1528,8 @@ void toggleDeleteMode(){
         if(shortcutChecks[i]){
             ShowWindow(shortcutChecks[i], deleteMode ? SW_SHOW : SW_HIDE);
         }
+        // Redraw shortcut button to show color change
+        if(i < shortcuts.size()) InvalidateRect(shortcuts[i].second, NULL, FALSE);
     }
     if(deleteMode){
         editMode = false; // Exit edit mode if entering delete mode
@@ -850,33 +1548,48 @@ void performDeleteSelected(){
     }
     if(toDelete.empty()){
         MessageBoxA(NULL, "No shortcuts selected.", "Delete Shortcuts", MB_OK|MB_ICONINFORMATION);
+        toggleDeleteMode(); // Exit delete mode
         return;
     }
     // Delete from end to start to keep indices valid
     for(int k=(int)toDelete.size()-1;k>=0;--k){
         size_t idx = toDelete[k];
+        // Destroy associated window controls
         DestroyWindow(shortcuts[idx].second);
         if(shortcutChecks[idx]) DestroyWindow(shortcutChecks[idx]);
+        // Destroy and remove icon if present
+        if(idx < shortcutIcons.size() && shortcutIcons[idx]) {
+            DestroyIcon(shortcutIcons[idx]);
+            shortcutIcons.erase(shortcutIcons.begin() + idx);
+        }
         shortcuts.erase(shortcuts.begin()+idx);
         shortcutChecks.erase(shortcutChecks.begin()+idx);
     }
-    // Recompute layout positions
+    // Recompute layout positions using panel origin
     nextShortcutY = 10;
-    HWND hMain = GetParent(hShortcutsPanel);
+    HWND hMain = hMainWindow ? hMainWindow : GetParent(hShortcutsPanel);
+    RECT rcPanel; GetWindowRect(hShortcutsPanel, &rcPanel);
+    POINT pt = {rcPanel.left, rcPanel.top};
+    ScreenToClient(hMain, &pt);
+    
+    int panelW = rcPanel.right - rcPanel.left;
+    int btnW = panelW - 40;
+    if(btnW < 200) btnW = 200;
+    
     for(size_t i=0;i<shortcuts.size();++i){
-        int baseX = 20 + (355 - 240)/2; // centered in panel
-        int baseY = 155 + nextShortcutY;
-        SetWindowPos(shortcuts[i].second, NULL, baseX, baseY, 240, 30, SWP_NOZORDER);
+        int baseX = pt.x + 20; // left margin within panel
+        int baseY = pt.y + 10 + nextShortcutY;
+        SetWindowPos(shortcuts[i].second, NULL, baseX, baseY, btnW, 30, SWP_NOZORDER);
         if(shortcutChecks[i]){
-            int chkX = (baseX - 20) - 22;
-            int chkY = (baseY - 155) + 7;
-            SetWindowPos(shortcutChecks[i], NULL, chkX, chkY, 16, 16, SWP_NOZORDER);
+            int chkX = baseX - 20;
+            int chkY = baseY + 7;
+            SetWindowPos(shortcutChecks[i], HWND_TOP, chkX, chkY, 16, 16, SWP_SHOWWINDOW);
             ShowWindow(shortcutChecks[i], SW_HIDE);
         }
         nextShortcutY += 35;
     }
     saveShortcuts();
-    deleteMode = false;
+    toggleDeleteMode(); // Exit delete mode after successful delete
     SendMessageA(hStatus, WM_SETTEXT, 0, (LPARAM)"Shortcuts deleted and saved.");
 }
 
@@ -968,6 +1681,100 @@ void doCombineNonOverride(){
     SendMessageA(hStatus, WM_SETTEXT,0,(LPARAM)"Combine running...");
 }
 
+void startBackupDaemon() {
+    // Start the backup daemon in the background with 1-minute check interval
+    std::thread([]() {
+        toolInvoke("--daemon 1");
+    }).detach();
+}
+
+void startUpdaterDaemon() {
+    // Start the updater daemon in the background for 24-hour update checks
+    std::thread([]() {
+        char exePath[MAX_PATH];
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        std::filesystem::path p(exePath);
+        auto dir = p.parent_path();
+        std::string updaterPath = (dir / "updater.exe").string();
+        std::string cmd = '"' + updaterPath + '"' + " --daemon";
+        
+        STARTUPINFOA si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        std::string cmdCopy = cmd;
+        if(CreateProcessA(NULL, cmdCopy.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }).detach();
+}
+
+void checkForUpdatesOnStartup() {
+    // Check if updates are available on startup
+    std::thread([]() {
+        // Small delay to let GUI fully initialize
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        
+        char exePath[MAX_PATH];
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        std::filesystem::path p(exePath);
+        auto dir = p.parent_path();
+        
+        // Read current version
+        std::string currentVersion = "0.0.0";
+        std::ifstream vf((dir / "version.txt").string());
+        if(vf.is_open()) {
+            std::getline(vf, currentVersion);
+            vf.close();
+        }
+        
+        // Read version from GitHub
+        std::string newVersion = currentVersion;
+        std::string versionUrl = "https://raw.githubusercontent.com/imasteredu2/maintenance_tools/tools/version.txt?t=" + 
+                                 std::to_string(std::time(nullptr));
+        
+        // Simple HTTP get
+        HINTERNET hInternet = InternetOpenA("Maintenance Tool", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+        if(hInternet) {
+            HINTERNET hUrl = InternetOpenUrlA(hInternet, versionUrl.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
+            if(hUrl) {
+                char buffer[256];
+                DWORD bytesRead = 0;
+                if(InternetReadFile(hUrl, buffer, sizeof(buffer) - 1, &bytesRead)) {
+                    buffer[bytesRead] = '\0';
+                    std::string versionData(buffer);
+                    size_t pos = versionData.find_first_not_of(" \t\r\n");
+                    if(pos != std::string::npos) {
+                        size_t end = versionData.find_first_of(" \t\r\n", pos);
+                        if(end == std::string::npos) end = versionData.length();
+                        newVersion = versionData.substr(pos, end - pos);
+                    }
+                }
+                InternetCloseHandle(hUrl);
+            }
+            InternetCloseHandle(hInternet);
+        }
+        
+        // Compare versions
+        if(newVersion != currentVersion) {
+            // New version available - ask user
+            std::string msg = "New version available!\n\nCurrent: " + currentVersion + 
+                             "\nLatest: " + newVersion + "\n\nUpdate now?";
+            if(MessageBoxA(NULL, msg.c_str(), "Update Available", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                // User wants to update
+                std::string updaterPath = (dir / "updater.exe").string();
+                std::string cmd = '"' + updaterPath + '"' + " --check-update";
+                STARTUPINFOA si{sizeof(si)};
+                PROCESS_INFORMATION pi{};
+                std::string cmdCopy = cmd;
+                if(CreateProcessA(NULL, cmdCopy.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+            }
+        }
+    }).detach();
+}
+
 void doCheckForUpdates(){
     SendMessageA(hStatus, WM_SETTEXT,0,(LPARAM)"Checking for updates...");
     
@@ -994,16 +1801,96 @@ void doCheckForUpdates(){
     }
 }
 
+void showSettingsDialog() {
+    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "STATIC", "Settings", 
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, 
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 250, hMainWindow, NULL, GetModuleHandle(NULL), NULL);
+    
+    SetWindowLongA(hDlg, GWL_STYLE, GetWindowLongA(hDlg, GWL_STYLE) | WS_DLGFRAME);
+    
+    int y = 20;
+    
+    // Auto-update at 24hr checkbox
+    HWND hChkAutoUpdate = CreateWindowA("BUTTON", "Auto-update when new version found (24hr check)", 
+        WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 20, y, 350, 20, hDlg, (HMENU)301, NULL, NULL);
+    SendMessageA(hChkAutoUpdate, BM_SETCHECK, appSettings.autoUpdateAt24h ? BST_CHECKED : BST_UNCHECKED, 0);
+    y += 30;
+    
+    // Update check interval label
+    CreateWindowA("STATIC", "Update check interval (hours, 1-24):", WS_CHILD|WS_VISIBLE, 20, y, 350, 20, hDlg, NULL, NULL, NULL);
+    y += 24;
+    
+    char intervalStr[10];
+    sprintf_s(intervalStr, sizeof(intervalStr), "%d", appSettings.updateCheckIntervalHours);
+    HWND hEditInterval = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", intervalStr, 
+        WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|ES_NUMBER, 20, y, 100, 24, hDlg, (HMENU)302, NULL, NULL);
+    y += 40;
+    
+    // Buttons
+    HWND hBtnOK = CreateWindowA("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 
+        100, y, 80, 30, hDlg, (HMENU)IDOK, NULL, NULL);
+    HWND hBtnCancel = CreateWindowA("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 
+        200, y, 80, 30, hDlg, (HMENU)IDCANCEL, NULL, NULL);
+    
+    // Modal loop
+    MSG msg;
+    bool done = false;
+    while(!done && GetMessageA(&msg, NULL, 0, 0)) {
+        if(msg.hwnd == hDlg || IsChild(hDlg, msg.hwnd)) {
+            if(msg.message == WM_COMMAND) {
+                int id = LOWORD(msg.wParam);
+                if(id == IDOK) {
+                    // Save settings
+                    appSettings.autoUpdateAt24h = (SendMessageA(hChkAutoUpdate, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    
+                    char val[10];
+                    GetWindowTextA(hEditInterval, val, sizeof(val));
+                    try {
+                        int interval = std::stoi(val);
+                        if(interval >= 1 && interval <= 24) {
+                            appSettings.updateCheckIntervalHours = interval;
+                        }
+                    } catch(...) {}
+                    
+                    saveSettings();
+                    done = true;
+                } else if(id == IDCANCEL) {
+                    done = true;
+                }
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    
+    DestroyWindow(hDlg);
+}
+
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
     case WM_CREATE: {
+        hMainWindow = h;
+        // Load theme preference and settings
+        loadTheme();
+        loadSettings();
+        
         // Enable dark mode/theme support for window
-        BOOL useDarkMode = TRUE;
+        BOOL useDarkMode = darkTheme ? TRUE : FALSE;
         DwmSetWindowAttribute(h, 20, &useDarkMode, sizeof(useDarkMode)); // DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         
-        // Create menu bar (File, Help)
+        // Create theme brushes
+        hBrushBg = CreateSolidBrush(RGB(240, 240, 240)); // Light background
+        hBrushBgDark = CreateSolidBrush(RGB(32, 32, 32)); // Dark background
+        hBrushControlBg = CreateSolidBrush(RGB(255, 255, 255)); // Light control background
+        hBrushControlBgDark = CreateSolidBrush(RGB(45, 45, 45)); // Dark control background
+        
+        // Create menu bar (File, View, Settings, Help)
         HMENU hMenu = CreateMenu();
         HMENU hFile = CreatePopupMenu();
         AppendMenuA(hFile, MF_STRING, 1000, "Exit");
+        HMENU hView = CreatePopupMenu();
+        AppendMenuA(hView, MF_STRING, 1003, darkTheme ? "Switch to Light Theme" : "Switch to Dark Theme");
+        HMENU hSettings = CreatePopupMenu();
+        AppendMenuA(hSettings, MF_STRING, 1004, "Settings...");
         HMENU hHelp = CreatePopupMenu();
         {
             std::string verLabel = std::string("Version: ") + getCurrentVersion();
@@ -1013,6 +1900,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
         AppendMenuA(hHelp, MF_STRING, 1001, "Check for Updates...");
         AppendMenuA(hHelp, MF_STRING, 1002, "About...");
         AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hFile, "File");
+        AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hView, "View");
+        AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hSettings, "Settings");
         AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hHelp, "Help");
         SetMenu(h, hMenu);
         DrawMenuBar(h);
@@ -1043,11 +1932,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
         // Lock PC button spanning from Logoff to Shutdown
         HWND hBtnLock = CreateWindow("BUTTON","Lock PC", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_OWNERDRAW, 20,90,355,30,h,(HMENU)16,NULL,NULL);
         
-        // Shortcut management buttons (row of 4)
-        HWND hBtnAddShortcut = CreateWindow("BUTTON","Add", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 20,130,85,30,h,(HMENU)8,NULL,NULL);
-        HWND hBtnSaveShortcuts = CreateWindow("BUTTON","Save", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 110,130,85,30,h,(HMENU)13,NULL,NULL);
-        HWND hBtnEditShortcut = CreateWindow("BUTTON","Edit", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 200,130,85,30,h,(HMENU)14,NULL,NULL);
-        HWND hBtnDeleteShortcut = CreateWindow("BUTTON","Delete", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 290,130,85,30,h,(HMENU)15,NULL,NULL);
+        // Shortcut management buttons (row of 4) - owner-draw for dark mode
+        hBtnAdd = CreateWindow("BUTTON","Add", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_OWNERDRAW, 20,130,85,30,h,(HMENU)8,NULL,NULL);
+        hBtnSave = CreateWindow("BUTTON","Save", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_OWNERDRAW, 110,130,85,30,h,(HMENU)13,NULL,NULL);
+        hBtnEdit = CreateWindow("BUTTON","Edit", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_OWNERDRAW, 200,130,85,30,h,(HMENU)14,NULL,NULL);
+        hBtnDelete = CreateWindow("BUTTON","Delete", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_OWNERDRAW, 290,130,85,30,h,(HMENU)15,NULL,NULL);
         
         // Shortcuts panel on Home tab
         HWND hLblShortcuts = CreateWindow("STATIC","Program Shortcuts:", WS_CHILD|WS_VISIBLE|SS_LEFT, 20,170,150,20,h,(HMENU)17,NULL,NULL);
@@ -1055,21 +1944,21 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
         // Load persisted shortcuts
         loadShortcuts(h);
         
-        // BACKUP TAB CONTROLS (initially hidden)
+        // BACKUP TAB CONTROLS (initially hidden) - owner-draw for dark mode
         // Row 1: Primary action buttons (larger for emphasis)
-        HWND hBtnBackup = CreateWindow("BUTTON","Run Backup", WS_CHILD|BS_PUSHBUTTON, 20,50,110,35,h,(HMENU)2,NULL,NULL);
-        HWND hBtnRestore = CreateWindow("BUTTON","Restore", WS_CHILD|BS_PUSHBUTTON, 135,50,110,35,h,(HMENU)3,NULL,NULL);
-        HWND hBtnStatus = CreateWindow("BUTTON","Check Status", WS_CHILD|BS_PUSHBUTTON, 250,50,125,35,h,(HMENU)11,NULL,NULL);
+        hBtnBackup = CreateWindow("BUTTON","Run Backup", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 20,50,110,35,h,(HMENU)2,NULL,NULL);
+        hBtnRestore = CreateWindow("BUTTON","Restore", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 135,50,110,35,h,(HMENU)3,NULL,NULL);
+        hBtnStatus = CreateWindow("BUTTON","Check Status", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 250,50,125,35,h,(HMENU)11,NULL,NULL);
         
         // Row 2: Job management buttons
-        HWND hBtnCreate = CreateWindow("BUTTON","Create Job", WS_CHILD|BS_PUSHBUTTON, 20,95,85,30,h,(HMENU)9,NULL,NULL);
-        HWND hBtnEdit = CreateWindow("BUTTON","Edit Job", WS_CHILD|BS_PUSHBUTTON, 110,95,85,30,h,(HMENU)10,NULL,NULL);
-        HWND hBtnDelete = CreateWindow("BUTTON","Delete Job", WS_CHILD|BS_PUSHBUTTON, 200,95,85,30,h,(HMENU)12,NULL,NULL);
-        HWND hBtnRefresh = CreateWindow("BUTTON","Refresh", WS_CHILD|BS_PUSHBUTTON, 290,95,85,30,h,(HMENU)1,NULL,NULL);
+        hBtnCreate = CreateWindow("BUTTON","Create Job", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 20,95,85,30,h,(HMENU)9,NULL,NULL);
+        hBtnEditJob = CreateWindow("BUTTON","Edit Job", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 110,95,85,30,h,(HMENU)10,NULL,NULL);
+        hBtnDeleteJob = CreateWindow("BUTTON","Delete Job", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 200,95,85,30,h,(HMENU)12,NULL,NULL);
+        hBtnRefresh = CreateWindow("BUTTON","Refresh", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 290,95,85,30,h,(HMENU)1,NULL,NULL);
         
         // Row 3: Combine and Update buttons
-        HWND hBtnCombine = CreateWindow("BUTTON","Combine Non-Override", WS_CHILD|BS_PUSHBUTTON, 20,130,160,30,h,(HMENU)18,NULL,NULL);
-        HWND hBtnCheckUpdate = CreateWindow("BUTTON","Check for Updates", WS_CHILD|BS_PUSHBUTTON, 185,130,190,30,h,(HMENU)19,NULL,NULL);
+        hBtnCombine = CreateWindow("BUTTON","Combine Non-Override", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 20,130,160,30,h,(HMENU)18,NULL,NULL);
+        hBtnCheckUpdate = CreateWindow("BUTTON","Check for Updates", WS_CHILD|BS_PUSHBUTTON|BS_OWNERDRAW, 185,130,190,30,h,(HMENU)19,NULL,NULL);
         
         // Jobs list on Backup tab
         HWND hLblJobs = CreateWindow("STATIC","Backup Jobs:", WS_CHILD|SS_LEFT, 20,170,150,20,h,NULL,NULL,NULL);
@@ -1080,6 +1969,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
         
         refreshJobs();
         switchTab(0); // Show Home tab by default
+        
+        // Check for updates on startup
+        checkForUpdatesOnStartup();
+        
+        // Start backup daemon in background
+        startBackupDaemon();
+        
+        // Start updater daemon in background for 24-hour update checks
+        startUpdaterDaemon();
+        
+        SendMessageA(hStatus, WM_SETTEXT, 0, (LPARAM)"Daemons started.");
     } break;
     case WM_NOTIFY: {
         NMHDR* pnmhdr = (NMHDR*)l;
@@ -1094,12 +1994,26 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
             HBRUSH hBrush = NULL;
             COLORREF textColor = RGB(255, 255, 255);
             HWND hBtnLock = GetDlgItem(h, 16);
+            bool isStandardButton = false;
             
+            // System action buttons (colored)
             if (pDIS->hwndItem == hBtnShutdown) hBrush = hBrushRed;
             else if (pDIS->hwndItem == hBtnRestart) hBrush = hBrushYellow;
             else if (pDIS->hwndItem == hBtnLogoff) hBrush = hBrushOrange;
             else if (pDIS->hwndItem == hBtnUpdateRestart) hBrush = hBrushBlue;
             else if (pDIS->hwndItem == hBtnLock) hBrush = hBrushGreen;
+            // Standard buttons (dark gray in dark mode, light gray in light mode)
+            else if (pDIS->hwndItem == hBtnAdd || pDIS->hwndItem == hBtnSave || 
+                     pDIS->hwndItem == hBtnEdit || pDIS->hwndItem == hBtnDelete ||
+                     pDIS->hwndItem == hBtnBackup || pDIS->hwndItem == hBtnRestore ||
+                     pDIS->hwndItem == hBtnStatus || pDIS->hwndItem == hBtnCreate ||
+                     pDIS->hwndItem == hBtnEditJob || pDIS->hwndItem == hBtnDeleteJob ||
+                     pDIS->hwndItem == hBtnRefresh || pDIS->hwndItem == hBtnCombine ||
+                     pDIS->hwndItem == hBtnCheckUpdate) {
+                isStandardButton = true;
+                hBrush = CreateSolidBrush(darkTheme ? RGB(60, 60, 60) : RGB(225, 225, 225));
+                textColor = darkTheme ? RGB(255, 255, 255) : RGB(0, 0, 0);
+            }
             
             if (hBrush) {
                 FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
@@ -1117,15 +2031,126 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
                     InflateRect(&rc, -2, -2);
                     DrawFocusRect(pDIS->hDC, &rc);
                 }
+                
+                // Clean up temporary brush
+                if (isStandardButton) DeleteObject(hBrush);
                 return TRUE;
             }
+            
+            // Check if this is a shortcut button
+            for (size_t i = 0; i < shortcuts.size(); ++i) {
+                if (shortcuts[i].second == pDIS->hwndItem) {
+                    // Draw shortcut button with icon and text
+                    HBRUSH bgBrush = NULL;
+                    bool needsCleanup = false;
+                    
+                    // Change background color based on edit/delete mode or dark theme
+                    if (deleteMode) {
+                        bgBrush = CreateSolidBrush(darkTheme ? RGB(120, 40, 40) : RGB(200, 100, 100)); // Dark red in dark mode
+                        needsCleanup = true;
+                    } else if (editMode) {
+                        bgBrush = CreateSolidBrush(darkTheme ? RGB(40, 80, 120) : RGB(100, 150, 200)); // Dark blue in dark mode
+                        needsCleanup = true;
+                    } else {
+                        bgBrush = CreateSolidBrush(darkTheme ? RGB(60, 60, 60) : RGB(225, 225, 225));
+                        needsCleanup = true;
+                    }
+                    
+                    FillRect(pDIS->hDC, &pDIS->rcItem, bgBrush);
+                    
+                    // Draw icon on the left
+                    if (i < shortcutIcons.size() && shortcutIcons[i]) {
+                        DrawIconEx(pDIS->hDC, pDIS->rcItem.left + 5, pDIS->rcItem.top + 7,
+                                   shortcutIcons[i], 16, 16, 0, NULL, DI_NORMAL);
+                    }
+                    
+                    // Draw text next to icon
+                    char text[256];
+                    GetWindowTextA(pDIS->hwndItem, text, sizeof(text));
+                    RECT textRect = pDIS->rcItem;
+                    textRect.left += 26; // Offset for icon
+                    SetBkMode(pDIS->hDC, TRANSPARENT);
+                    SetTextColor(pDIS->hDC, darkTheme ? RGB(255, 255, 255) : RGB(0, 0, 0));
+                    DrawTextA(pDIS->hDC, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    
+                    // Draw border if focused/pressed
+                    if (pDIS->itemState & (ODS_FOCUS | ODS_SELECTED)) {
+                        DrawEdge(pDIS->hDC, &pDIS->rcItem, 
+                                (pDIS->itemState & ODS_SELECTED) ? EDGE_SUNKEN : EDGE_RAISED, 
+                                BF_RECT);
+                    }
+                    
+                    // Clean up the brush
+                    if (needsCleanup) DeleteObject(bgBrush);
+                    
+                    return TRUE;
+                }
+            }
         }
+    } break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        if (darkTheme) {
+            HDC hdc = (HDC)w;
+            SetTextColor(hdc, RGB(255, 255, 255));
+            SetBkColor(hdc, RGB(32, 32, 32));
+            return (LRESULT)hBrushBgDark;
+        }
+    } break;
+    case WM_CTLCOLORLISTBOX: {
+        if (darkTheme) {
+            HDC hdc = (HDC)w;
+            SetTextColor(hdc, RGB(255, 255, 255)); // White text
+            SetBkColor(hdc, RGB(45, 45, 45)); // Dark background
+            return (LRESULT)hBrushControlBgDark;
+        }
+    } break;
+    case WM_ERASEBKGND: {
+        if (darkTheme) {
+            HDC hdc = (HDC)w;
+            RECT rc;
+            GetClientRect(h, &rc);
+            FillRect(hdc, &rc, hBrushBgDark);
+            return 1;
+        }
+    } break;
+    case WM_SIZE: {
+        int clientW = LOWORD(l);
+        int clientH = HIWORD(l);
+        layoutAllUI(clientW, clientH);
     } break;
     case WM_COMMAND: {
         int id = LOWORD(w);
         if(id==1000) { PostMessage(h, WM_CLOSE, 0, 0); }
         else if(id==1001) { doCheckForUpdates(); }
         else if(id==1002) { showAbout(); }
+        else if(id==1003) { 
+            // Toggle theme and refresh GUI
+            darkTheme = !darkTheme;
+            saveTheme();
+            
+            // Update dark mode attribute
+            BOOL useDarkMode = darkTheme ? TRUE : FALSE;
+            DwmSetWindowAttribute(h, 20, &useDarkMode, sizeof(useDarkMode));
+            
+            // Update menu text
+            HMENU hMenu = GetMenu(h);
+            HMENU hView = GetSubMenu(hMenu, 1); // View menu is second (index 1)
+            ModifyMenuA(hView, 1003, MF_BYCOMMAND | MF_STRING, 1003, darkTheme ? "Switch to Light Theme" : "Switch to Dark Theme");
+            DrawMenuBar(h);
+            
+            // Force complete redraw of all controls
+            InvalidateRect(h, NULL, TRUE);
+            UpdateWindow(h);
+            
+            // Redraw all child windows
+            EnumChildWindows(h, [](HWND hwndChild, LPARAM) -> BOOL {
+                InvalidateRect(hwndChild, NULL, TRUE);
+                UpdateWindow(hwndChild);
+                return TRUE;
+            }, 0);
+        }
+        else if(id==1004) { showSettingsDialog(); }
         else if(id==1) refreshJobs();
         else if(id==2) doBackup();
         else if(id==3) doRestore();
@@ -1161,13 +2186,20 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l){ switch(m){
         }
     } break;
     case WM_DESTROY: 
-        DeleteObject(hBrushRed);
-        DeleteObject(hBrushYellow);
-        DeleteObject(hBrushOrange);
-        DeleteObject(hBrushBlue);
-        DeleteObject(hBrushGreen);
-        DeleteObject(hBrushGreen);
-        PostQuitMessage(0); 
+            DeleteObject(hBrushRed);
+            DeleteObject(hBrushYellow);
+            DeleteObject(hBrushOrange);
+            DeleteObject(hBrushBlue);
+            DeleteObject(hBrushGreen);
+            if(hBrushBg) DeleteObject(hBrushBg);
+            if(hBrushBgDark) DeleteObject(hBrushBgDark);
+            if(hBrushControlBg) DeleteObject(hBrushControlBg);
+            if(hBrushControlBgDark) DeleteObject(hBrushControlBgDark);
+            // Destroy any loaded shortcut icons
+            for(auto ic : shortcutIcons) {
+                if(ic) DestroyIcon(ic);
+            }
+            PostQuitMessage(0);
         break;
  }
  return DefWindowProc(h,m,w,l);

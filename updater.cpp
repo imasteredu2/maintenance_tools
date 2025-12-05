@@ -135,6 +135,43 @@ std::string trim(const std::string& str) {
     return str.substr(first, last - first + 1);
 }
 
+// Track last update check time
+void saveLastUpdateCheck() {
+    std::ofstream f("last_update_check.txt");
+    if(f.is_open()) {
+        auto now = std::chrono::system_clock::now();
+        auto timestamp = std::chrono::system_clock::to_time_t(now);
+        f << timestamp;
+        f.close();
+    }
+}
+
+bool shouldCheckForUpdates() {
+    std::ifstream f("last_update_check.txt");
+    if(!f.is_open()) return true; // Never checked, should check now
+    
+    std::string line;
+    if(!std::getline(f, line)) {
+        f.close();
+        return true;
+    }
+    f.close();
+    
+    try {
+        time_t lastCheck = std::stoll(line);
+        auto now = std::chrono::system_clock::now();
+        auto currentTime = std::chrono::system_clock::to_time_t(now);
+        
+        // Check if 24 hours have passed (86400 seconds)
+        if((currentTime - lastCheck) >= 86400) {
+            return true;
+        }
+    } catch(...) {
+        return true;
+    }
+    return false;
+}
+
 // Check for updates and prompt user
 bool checkForUpdates(const std::string& currentVersion, std::string& newVersion) {
     // Ensure a local 'version' folder exists
@@ -187,18 +224,124 @@ bool checkForUpdates(const std::string& currentVersion, std::string& newVersion)
     return cmp > 0; // true if new version is higher
 }
 
+// Settings structures for updater
+struct UpdaterSettings {
+    bool autoUpdateAt24h = true;
+    int updateCheckIntervalHours = 12;
+};
+
+UpdaterSettings loadUpdaterSettings() {
+    UpdaterSettings settings;
+    std::ifstream f("settings.txt");
+    if(f.is_open()) {
+        std::string line;
+        while(std::getline(f, line)) {
+            // Simple parsing
+            if(line.find("auto_update_at_24h=") == 0) {
+                settings.autoUpdateAt24h = (line.find("1") != std::string::npos || line.find("true") != std::string::npos);
+            } else if(line.find("update_check_interval_hours=") == 0) {
+                try {
+                    size_t eqPos = line.find('=');
+                    int val = std::stoi(line.substr(eqPos + 1));
+                    if(val >= 1 && val <= 24) settings.updateCheckIntervalHours = val;
+                } catch(...) {}
+            }
+        }
+        f.close();
+    }
+    return settings;
+}
+
 int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int){
-    // Check for --check-update flag
+    // Check for --daemon flag for 24-hour update checks
     int argc = __argc; char** argv = __argv;
+    bool isDaemon = false;
     bool checkUpdate = false;
     
     for(int i=1; i<argc; i++) {
+        if(strcmp(argv[i], "--daemon")==0) {
+            isDaemon = true;
+            break;
+        }
         if(strcmp(argv[i], "--check-update")==0) {
             checkUpdate = true;
             break;
         }
     }
     
+    if(isDaemon) {
+        // Run as daemon - check at configured interval
+        UpdaterSettings settings = loadUpdaterSettings();
+        
+        while(true) {
+            if(shouldCheckForUpdates()) {
+                std::string currentVersion = "0.0.0";
+                std::ifstream vf("version.txt");
+                if(vf) {
+                    std::getline(vf, currentVersion);
+                    currentVersion = trim(currentVersion);
+                    vf.close();
+                }
+                
+                std::string newVersion;
+                if(checkForUpdates(currentVersion, newVersion)) {
+                    saveLastUpdateCheck();
+                    
+                    // Check if auto-update is enabled
+                    if(settings.autoUpdateAt24h) {
+                        // Auto-update: download and apply update automatically
+                        char exePath[MAX_PATH];
+                        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+                        std::filesystem::path p(exePath);
+                        auto dir = p.parent_path();
+                        
+                        std::string guiFilename = "maintenance_tool_gui_v" + newVersion + ".exe";
+                        std::string toolFilename = "maintenance_tool_v" + newVersion + ".exe";
+                        std::string guiUrl = "https://github.com/imasteredu2/maintenance_tools/releases/download/v" + newVersion + "/" + guiFilename;
+                        std::string toolUrl = "https://github.com/imasteredu2/maintenance_tools/releases/download/v" + newVersion + "/" + toolFilename;
+                        
+                        std::string tempGui = (dir / ("temp_gui_" + newVersion + ".exe")).string();
+                        std::string tempTool = (dir / ("temp_tool_" + newVersion + ".exe")).string();
+                        
+                        if(downloadFile(guiUrl, tempGui) && downloadFile(toolUrl, tempTool)) {
+                            // Kill maintenance processes
+                            system("taskkill /F /IM maintenance_tool_gui.exe >nul 2>&1");
+                            system("taskkill /F /IM maintenance_tool.exe >nul 2>&1");
+                            
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            
+                            // Replace executables
+                            CopyFileA(tempGui.c_str(), (dir / "maintenance_tool_gui.exe").string().c_str(), FALSE);
+                            CopyFileA(tempTool.c_str(), (dir / "maintenance_tool.exe").string().c_str(), FALSE);
+                            
+                            // Update version file
+                            std::ofstream vf((dir / "version.txt").string());
+                            if(vf.is_open()) {
+                                vf << newVersion;
+                                vf.close();
+                            }
+                            
+                            // Clean up temp files
+                            std::filesystem::remove(tempGui);
+                            std::filesystem::remove(tempTool);
+                            
+                            // Restart GUI
+                            SHELLEXECUTEINFOA sei{sizeof(sei)};
+                            sei.lpVerb = "open";
+                            sei.lpFile = (dir / "maintenance_tool_gui.exe").string().c_str();
+                            sei.nShow = SW_SHOWNORMAL;
+                            ShellExecuteExA(&sei);
+                        }
+                    }
+                }
+            }
+            // Sleep for configured interval (default 1 hour check, actual check every 12/24 hrs)
+            std::this_thread::sleep_for(std::chrono::minutes(60));
+        }
+        return 0;
+    }
+    
+    // Check for --check-update flag
     if(checkUpdate) {
         // Read current version
         std::string currentVersion = "0.0.0";
